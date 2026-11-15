@@ -102,6 +102,7 @@ function load() {
 function normalize(s) {
   if (!Array.isArray(s.todos)) s.todos = [];
   s.todos.forEach(t => { if (!t.date) t.date = dayKey(t.createdAt || Date.now()); }); // each to-do belongs to one day
+  (s.goals || []).forEach(g => { if (!g.startDate) g.startDate = dayKey(g.createdAt || Date.now()); }); // goals run from a start date
   return s;
 }
 function save() {
@@ -113,8 +114,8 @@ const goal = id => S.goals.find(g => g.id === id);
 const project = id => S.projects.find(p => p.id === id);
 const projectsOf = gid => S.projects.filter(p => p.goalId === gid);
 
-function newGoal(name, targetHours, color, deadline = '') {
-  const g = { id: uid(), name, targetHours: Math.max(1, targetHours || 100), color: color || COLORS[S.goals.length % COLORS.length], deadline, createdAt: Date.now() };
+function newGoal(name, targetHours, color, deadline = '', startDate = dayKey(Date.now())) {
+  const g = { id: uid(), name, targetHours: Math.max(1, targetHours || 100), color: color || COLORS[S.goals.length % COLORS.length], startDate, deadline, createdAt: Date.now() };
   S.goals.push(g); return g;
 }
 function newProject(name, goalId, color) {
@@ -177,14 +178,67 @@ function bestStreak() {
   }
   return best;
 }
+/* ---------- daily time plan for a goal ----------
+   The target hours are spread evenly from the start date to the deadline (both days count).
+   e.g. 80h from 15 Nov to 30 Nov = 16 days → 5h a day. */
+const dayDiff = (a, b) => Math.round((new Date(b + 'T00:00') - new Date(a + 'T00:00')) / DAY); // days from a to b
+const fmtPlan = ms => fmtDur(Math.ceil(ms / 60000) * 60000); // round up to the next minute
+function goalTodayMs(gid) {
+  const ids = new Set(projectsOf(gid).map(p => p.id)), k = dayKey(Date.now());
+  return sumWhere(s => ids.has(s.projectId) && dayKey(s.start) === k);
+}
+function goalPlan(g, ms = goalMs(g.id)) {
+  const today = dayKey(Date.now());
+  const start = g.startDate || dayKey(g.createdAt || Date.now());
+  const target = g.targetHours * 3600000, left = Math.max(0, target - ms);
+  const p = { start, deadline: g.deadline || '', left, reached: left === 0 };
+  if (!p.deadline) return p;
+  p.totalDays = dayDiff(start, p.deadline) + 1;
+  if (p.totalDays < 1) return { ...p, deadline: '' }; // bad dates (deadline before start): no plan
+  p.perDay =target / p.totalDays;                       // the plan: same amount every day
+  p.notStarted = start > today;
+  p.startsIn = dayDiff(today, start);
+  p.passed = p.deadline < today;
+  p.daysLeft = Math.max(0, dayDiff(p.notStarted ? start : today, p.deadline) + 1);
+  p.needed = p.daysLeft ? left / p.daysLeft : 0;         // what's needed from now on to still finish in time
+  return p;
+}
 function goalPace(g, ms) {
-  if (!g.deadline) return '';
-  const days = Math.round((new Date(g.deadline + 'T00:00').getTime() - startOfDay(Date.now())) / DAY);
-  const left = Math.max(0, g.targetHours * 3600000 - ms);
-  if (left === 0) return 'Target reached 🎉';
-  if (days < 0) return 'Deadline passed';
-  if (days === 0) return 'Deadline is today';
-  return `${days} day${days === 1 ? '' : 's'} left · ${fmtDur(left / days)}/day needed`;
+  const p = goalPlan(g, ms);
+  if (p.reached) return 'Target reached 🎉';
+  if (!p.deadline) return '';
+  if (p.passed) return 'Deadline passed';
+  if (p.notStarted) return `Starts in ${p.startsIn} day${p.startsIn === 1 ? '' : 's'}`;
+  return `${p.daysLeft} day${p.daysLeft === 1 ? '' : 's'} left · ${fmtPlan(p.needed)}/day needed`;
+}
+/* Live text under the goal form: "About 5h a day for 16 days" */
+function planPreview(hours, start, deadline) {
+  if (!deadline) return { text: 'Add a deadline to see how much time you need to give this goal every day.' };
+  if (start && deadline < start) return { warn: true, text: 'The deadline must be on or after the start date.' };
+  const days = dayDiff(start, deadline) + 1, per = (Number(hours) || 0) * 3600000 / days;
+  if (per >= DAY) return { warn: true, text: `That's ${fmtPlan(per)} a day, more than 24 hours. Pick a later deadline or fewer hours.` };
+  return { text: `About <b>${fmtPlan(per)}</b> a day for <b>${days} day${days === 1 ? '' : 's'}</b>.` };
+}
+function updatePlanPreview(f) {
+  const out = f.querySelector('[data-plan-preview]');
+  if (!out) return;
+  const r = planPreview(f.hours.value, f.start.value || dayKey(Date.now()), f.deadline.value);
+  out.innerHTML = r.text; out.classList.toggle('warn', !!r.warn);
+}
+function planTiles(g, ms) {
+  const p = goalPlan(g, ms);
+  if (!p.deadline) return `<div class="plan-empty"><span>Add a deadline to get a daily time plan for this goal.</span>
+    <button class="link" data-action="edit-goal" data-id="${g.id}">Add deadline</button></div>`;
+  const t = goalTodayMs(g.id);
+  const todayTile = p.notStarted
+    ? `<div class="plan-t"><span>Today</span><b>–</b><em>starts ${shortDate(p.start)}</em></div>`
+    : `<div class="plan-t"><span>Today</span><b>${fmtDur(t)}</b><em>of ${fmtPlan(p.perDay)}</em>
+        <div class="bar"><i style="width:${clamp01(t / p.perDay) * 100}%"></i></div></div>`;
+  return `<div class="plan">
+    <div class="plan-t"><span>Daily plan</span><b>${fmtPlan(p.perDay)}</b><em>for ${p.totalDays} day${p.totalDays === 1 ? '' : 's'}</em></div>
+    ${todayTile}
+    <div class="plan-t"><span>Needed now</span><b>${p.reached ? 'Done' : p.passed ? '–' : fmtPlan(p.needed)}</b>
+      <em>${p.reached ? 'target reached' : p.passed ? 'deadline passed' : 'a day to finish'}</em></div></div>`;
 }
 
 /* ---------------- UI state (not saved) ---------------- */
@@ -475,9 +529,11 @@ function viewHome() {
   } else {
     html += `<div class="sec-h"><h3>Your goals</h3><button class="link" data-action="tab" data-tab="goals">See all</button></div>
       <div class="hscroll">${S.goals.map(g => {
-        const ms = goalMs(g.id), pct = ms / (g.targetHours * 3600000);
+        const ms = goalMs(g.id), pct = ms / (g.targetHours * 3600000), p = goalPlan(g, ms);
+        const planLine = p.perDay && !p.passed && !p.reached
+          ? `<span class="today-l">${p.notStarted ? `Starts ${shortDate(p.start)} · ${fmtPlan(p.perDay)}/day` : `Today ${fmtDur(goalTodayMs(g.id))} of ${fmtPlan(p.perDay)}`}</span>` : '';
         return `<button class="gcard" data-action="open-goal" data-id="${g.id}"><span class="dot" style="background:${g.color}"></span>
-          <b>${esc(g.name)}</b><span class="muted sm">${fmtHours(ms)} of ${g.targetHours}h · ${Math.round(clamp01(pct) * 100)}%</span>
+          <b>${esc(g.name)}</b><span class="muted sm">${fmtHours(ms)} of ${g.targetHours}h · ${Math.round(clamp01(pct) * 100)}%</span>${planLine}
           <div class="bar"><i style="width:${clamp01(pct) * 100}%;background:${g.color}"></i></div></button>`;
       }).join('')}</div>`;
   }
@@ -501,9 +557,9 @@ function viewGoals() {
     <button class="icon-b solid" data-action="new-goal" aria-label="New goal">${ICON.plus}</button></header>`;
   if (!S.goals.length) return head + empty(ICON.target, 'No goals yet', 'A goal is the big thing you are working towards, like "Learn Flutter" or "Crack the exam".', 'Create a goal', 'new-goal');
   return head + `<div class="list">${S.goals.map(g => {
-    const ms = goalMs(g.id), pct = ms / (g.targetHours * 3600000), n = projectsOf(g.id).length;
+    const ms = goalMs(g.id), pct = ms / (g.targetHours * 3600000), n = projectsOf(g.id).length, p = goalPlan(g, ms);
     return `<button class="row" data-action="open-goal" data-id="${g.id}">
-      <div class="row-main"><b>${esc(g.name)}</b><span>${fmtHours(ms)} of ${g.targetHours}h · ${n} project${n === 1 ? '' : 's'}</span>
+      <div class="row-main"><b>${esc(g.name)}</b><span>${fmtHours(ms)} of ${g.targetHours}h · ${p.perDay ? `${fmtPlan(p.perDay)}/day` : `${n} project${n === 1 ? '' : 's'}`}</span>
         <div class="bar"><i style="width:${clamp01(pct) * 100}%;background:${g.color}"></i></div></div>
       <span class="pct">${Math.round(clamp01(pct) * 100)}%</span></button>`;
   }).join('')}</div><p class="hint">Tap a goal to add projects and tasks.</p>`;
@@ -513,13 +569,18 @@ function viewGoal(id) {
   const g = goal(id);
   const head = (title, right = '<span></span>') => `<header class="bar-h"><button class="icon-b" data-action="back" aria-label="Back">${ICON.back}</button><h2>${title}</h2>${right}</header>`;
   if (!g) return head('Goal');
-  const ms = goalMs(id), pct = ms / (g.targetHours * 3600000), ps = projectsOf(id);
+  const ms = goalMs(id), pct = ms / (g.targetHours * 3600000), ps = projectsOf(id), p = goalPlan(g, ms);
+  const dates = p.deadline
+    ? `${shortDate(p.start)} → ${shortDate(p.deadline)} · ${p.totalDays} day${p.totalDays === 1 ? '' : 's'}`
+    : `${p.start > dayKey(Date.now()) ? 'Starts' : 'Started'} ${shortDate(p.start)} · no deadline`;
   return head('Goal', `<button class="icon-b" data-action="edit-goal" data-id="${id}" aria-label="Edit goal">${ICON.edit}</button>`) + `
     <section class="hero"><div class="hero-glow" style="--c:${g.color}"></div><div class="hero-col">
       <h1 class="g-title">${esc(g.name)}</h1>
+      <p class="g-dates">${dates}</p>
       <p class="muted sm">${goalPace(g, ms) || 'Keep showing up. It compounds.'}</p>
       <div class="g-nums"><b>${fmtHours(ms)}</b><span>/ ${g.targetHours}h</span><em>${Math.round(clamp01(pct) * 100)}%</em></div>
       <div class="bar lg"><i style="width:${clamp01(pct) * 100}%"></i></div></div></section>
+    ${planTiles(g, ms)}
     <div class="sec-h"><h3>Projects</h3><button class="link" data-action="new-project" data-goal="${id}">+ Add project</button></div>
     ${ps.length ? ps.map(projectCard).join('') : empty(ICON.spark, 'Add your first project', 'Projects are the pieces of this goal you actually work on.', 'Add project', 'new-project', `data-goal="${id}"`)}`;
 }
@@ -704,11 +765,15 @@ function viewSettings() {
    SHEETS (pop-up forms)
    ===================================================================== */
 function goalSheet(id) {
-  const g = id ? goal(id) : null;
-  openSheet(`<form data-form="goal" data-id="${id || ''}" autocomplete="off"><h3 class="sheet-t">${g ? 'Edit goal' : 'New goal'}</h3>
-    <label class="field"><span>Goal</span><input name="name" required maxlength="60" value="${esc(g?.name || '')}" placeholder="e.g. Become a web developer"></label>
-    <div class="grid2"><label class="field"><span>Target hours</span><input name="hours" type="number" min="1" inputmode="numeric" required value="${g?.targetHours || 100}"></label>
-      <label class="field"><span>Deadline <em>(optional)</em></span><input name="deadline" type="date" min="${dayKey(Date.now())}" value="${g?.deadline || ''}"></label></div>
+  const g = id ? goal(id) : null, today = dayKey(Date.now());
+  const start = g?.startDate || today, hours = g?.targetHours || 100, deadline = g?.deadline || '';
+  const pv = planPreview(hours, start, deadline);
+  openSheet(`<form data-form="goal" data-id="${id || ''}" autocomplete="off" novalidate><h3 class="sheet-t">${g ? 'Edit goal' : 'New goal'}</h3>
+    <label class="field"><span>Goal</span><input name="name" maxlength="60" value="${esc(g?.name || '')}" placeholder="e.g. Become a web developer"></label>
+    <div class="grid2"><label class="field"><span>Start date</span><input name="start" type="date" ${start >= today ? `min="${today}"` : ''} value="${start}"></label>
+      <label class="field"><span>Deadline <em>(optional)</em></span><input name="deadline" type="date" min="${today}" value="${deadline}"></label></div>
+    <label class="field"><span>Target hours</span><input name="hours" type="number" min="1" step="1" inputmode="numeric" value="${hours}"></label>
+    <p class="plan-preview ${pv.warn ? 'warn' : ''}" data-plan-preview>${pv.text}</p>
     ${colorPicker(g?.color || COLORS[S.goals.length % COLORS.length])}
     <button class="btn primary" type="submit">${g ? 'Save changes' : 'Create goal'}</button>
     ${g ? `<button class="btn text danger-t" type="button" data-action="del-goal" data-id="${id}">Delete goal</button>` : ''}</form>`);
@@ -886,13 +951,22 @@ const FORM = {
     back(2); toast(`Saved ${fmtDur(ms)}. Keep it up!`);
   },
   goal: (f, d) => {
-    const id = f.dataset.id, name = d.get('name').trim();
-    if (!name) return;
-    const vals = { name, targetHours: Math.max(1, +d.get('hours') || 100), deadline: d.get('deadline') || '', color: d.get('color') || COLORS[0] };
-    // A deadline can be today or later, never in the past (YYYY-MM-DD strings compare correctly as text)
-    if (vals.deadline && vals.deadline < dayKey(Date.now())) return toast('Pick today or a future date for the deadline');
-    if (id) { Object.assign(goal(id), vals); save(); back(); render(); toast('Goal updated'); }
-    else { const g = newGoal(vals.name, vals.targetHours, vals.color, vals.deadline); save(); sheetInto({ type: 'goal', id: g.id }); toast('Goal created. Now add a project.'); }
+    const id = f.dataset.id, old = id ? goal(id) : null, today = dayKey(Date.now());
+    const name = (d.get('name') || '').trim();
+    if (!name) return toast('Give your goal a name');
+    const hours = Number(d.get('hours'));
+    if (!Number.isFinite(hours) || hours < 1) return toast('Target hours must be at least 1');
+    const start = d.get('start') || old?.startDate || today, deadline = d.get('deadline') || '';
+    // Dates are "YYYY-MM-DD" text, which compares correctly.
+    // Start: today or later (an existing goal may keep the start date it already had).
+    if (start < today && start !== old?.startDate) return toast('Pick today or a future date to start');
+    // Deadline: today or later, and not before the start.
+    if (deadline && deadline < today) return toast('Pick today or a future date for the deadline');
+    if (deadline && deadline < start) return toast('The deadline must be on or after the start date');
+    if (deadline && planPreview(hours, start, deadline).warn) return toast('That needs more than 24 hours a day. Pick a later deadline or fewer hours.');
+    const vals = { name, targetHours: Math.round(hours), startDate: start, deadline, color: d.get('color') || COLORS[0] };
+    if (old) { Object.assign(old, vals); save(); back(); render(); toast('Goal updated'); }
+    else { const g = newGoal(vals.name, vals.targetHours, vals.color, vals.deadline, vals.startDate); save(); sheetInto({ type: 'goal', id: g.id }); toast('Goal created. Now add a project.'); }
   },
   project: (f, d) => {
     const id = f.dataset.id, name = d.get('name').trim();
@@ -974,9 +1048,9 @@ function seedDemo() {
   let a = 20261107;
   const rnd = () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
   const now = Date.now();
-  const g1 = newGoal('Become a web developer', 300, COLORS[0], dayKey(addDays(now, 120)));
-  const g2 = newGoal('Crack the GATE exam', 250, COLORS[1], dayKey(addDays(now, 210)));
-  const g3 = newGoal('Read 12 books this year', 60, COLORS[3]);
+  const g1 = newGoal('Become a web developer', 300, COLORS[0], dayKey(addDays(now, 120)), dayKey(addDays(now, -75)));
+  const g2 = newGoal('Crack the GATE exam', 250, COLORS[1], dayKey(addDays(now, 210)), dayKey(addDays(now, -60)));
+  const g3 = newGoal('Read 12 books this year', 60, COLORS[3], '', dayKey(addDays(now, -40)));
   const ps = [
     newProject('Portfolio website', g1.id, COLORS[0]), newProject('JavaScript course', g1.id, COLORS[2]),
     newProject('React to-do app', g1.id, COLORS[5]), newProject('Maths practice', g2.id, COLORS[1]),
@@ -1020,7 +1094,11 @@ document.addEventListener('submit', e => {
   e.preventDefault();
   fn(f, new FormData(f));
 });
+document.addEventListener('input', e => {
+  if (e.target.form?.dataset.form === 'goal') updatePlanPreview(e.target.form);
+});
 document.addEventListener('change', e => {
+  if (e.target.form?.dataset.form === 'goal') updatePlanPreview(e.target.form);
   const t = e.target;
   if (t.name === 'pick') ui.pick = t.value;
   if (t.name === 'target' && t.form?.dataset.form === 'start') {
