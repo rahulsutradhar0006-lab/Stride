@@ -1,6 +1,6 @@
 /* Service worker: lets Stride open with no internet.
    Strategy: try the network first (so updates show up), fall back to the saved copy. */
-const CACHE = 'stride-v3';
+const CACHE = 'stride-v4';
 const FILES = ['./', 'index.html', 'css/style.css', 'js/app.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png'];
 

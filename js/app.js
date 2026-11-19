@@ -179,8 +179,11 @@ function bestStreak() {
   return best;
 }
 /* ---------- daily time plan for a goal ----------
-   The target hours are spread evenly from the start date to the deadline (both days count).
-   e.g. 80h from 15 Nov to 30 Nov = 16 days → 5h a day. */
+   Daily plan = hours still left ÷ days still left (today and the deadline both count).
+   It is worked out at the start of each day: hours you log today don't shrink today's plan,
+   but tomorrow's plan is recalculated with them taken off.
+   e.g. 20h goal, 15–30 Nov. On 19 Nov with 0h done: 20h ÷ 12 days = 1h 40m a day.
+        Do 4h that day → on 20 Nov: 16h ÷ 11 days = 1h 28m a day. */
 const dayDiff = (a, b) => Math.round((new Date(b + 'T00:00') - new Date(a + 'T00:00')) / DAY); // days from a to b
 const fmtPlan = ms => fmtDur(Math.ceil(ms / 60000) * 60000); // round up to the next minute
 function goalTodayMs(gid) {
@@ -191,16 +194,17 @@ function goalPlan(g, ms = goalMs(g.id)) {
   const today = dayKey(Date.now());
   const start = g.startDate || dayKey(g.createdAt || Date.now());
   const target = g.targetHours * 3600000, left = Math.max(0, target - ms);
-  const p = { start, deadline: g.deadline || '', left, reached: left === 0 };
+  const p = { start, deadline: g.deadline || '', target, left, reached: left === 0 };
   if (!p.deadline) return p;
   p.totalDays = dayDiff(start, p.deadline) + 1;
   if (p.totalDays < 1) return { ...p, deadline: '' }; // bad dates (deadline before start): no plan
-  p.perDay =target / p.totalDays;                       // the plan: same amount every day
   p.notStarted = start > today;
   p.startsIn = dayDiff(today, start);
   p.passed = p.deadline < today;
   p.daysLeft = Math.max(0, dayDiff(p.notStarted ? start : today, p.deadline) + 1);
-  p.needed = p.daysLeft ? left / p.daysLeft : 0;         // what's needed from now on to still finish in time
+  const doneBeforeToday = p.notStarted ? ms : ms - goalTodayMs(g.id);
+  p.leftAtDayStart = Math.max(0, target - doneBeforeToday);
+  p.perDay = p.daysLeft ? p.leftAtDayStart / p.daysLeft : 0; // today's share of what is left
   return p;
 }
 function goalPace(g, ms) {
@@ -209,20 +213,27 @@ function goalPace(g, ms) {
   if (!p.deadline) return '';
   if (p.passed) return 'Deadline passed';
   if (p.notStarted) return `Starts in ${p.startsIn} day${p.startsIn === 1 ? '' : 's'}`;
-  return `${p.daysLeft} day${p.daysLeft === 1 ? '' : 's'} left · ${fmtPlan(p.needed)}/day needed`;
+  return `${p.daysLeft} day${p.daysLeft === 1 ? '' : 's'} left · ${fmtPlan(p.perDay)} a day`;
 }
+/* Hours already logged on a goal before today (used by the edit form) */
+function goalDoneBeforeToday(id) { const g = id && goal(id); return g ? goalMs(g.id) - goalTodayMs(g.id) : 0; }
 /* Live text under the goal form: "About 5h a day for 16 days" */
-function planPreview(hours, start, deadline) {
+function planPreview(hours, start, deadline, doneMs = 0) {
   if (!deadline) return { text: 'Add a deadline to see how much time you need to give this goal every day.' };
+  const today = dayKey(Date.now());
+  if (deadline < today) return { warn: true, text: 'The deadline is in the past. Pick today or a later date.' };
   if (start && deadline < start) return { warn: true, text: 'The deadline must be on or after the start date.' };
-  const days = dayDiff(start, deadline) + 1, per = (Number(hours) || 0) * 3600000 / days;
+  const from = start > today ? start : today;
+  const days = dayDiff(from, deadline) + 1, left = Math.max(0, (Number(hours) || 0) * 3600000 - doneMs);
+  if (!left) return { text: 'You have already reached this target. 🎉' };
+  const per = left / days;
   if (per >= DAY) return { warn: true, text: `That's ${fmtPlan(per)} a day, more than 24 hours. Pick a later deadline or fewer hours.` };
-  return { text: `About <b>${fmtPlan(per)}</b> a day for <b>${days} day${days === 1 ? '' : 's'}</b>.` };
+  return { text: `About <b>${fmtPlan(per)}</b> a day for <b>${days} day${days === 1 ? '' : 's'}</b>${doneMs > 0 ? `, after the ${fmtHours(doneMs)} you've already done` : ''}. It updates every day as you log time.` };
 }
 function updatePlanPreview(f) {
   const out = f.querySelector('[data-plan-preview]');
   if (!out) return;
-  const r = planPreview(f.hours.value, f.start.value || dayKey(Date.now()), f.deadline.value);
+  const r = planPreview(f.hours.value, f.start.value || dayKey(Date.now()), f.deadline.value, goalDoneBeforeToday(f.dataset.id));
   out.innerHTML = r.text; out.classList.toggle('warn', !!r.warn);
 }
 function planTiles(g, ms) {
@@ -234,11 +245,13 @@ function planTiles(g, ms) {
     ? `<div class="plan-t"><span>Today</span><b>–</b><em>starts ${shortDate(p.start)}</em></div>`
     : `<div class="plan-t"><span>Today</span><b>${fmtDur(t)}</b><em>of ${fmtPlan(p.perDay)}</em>
         <div class="bar"><i style="width:${clamp01(t / p.perDay) * 100}%"></i></div></div>`;
+  const plural = n => (n === 1 ? '' : 's');
   return `<div class="plan">
-    <div class="plan-t"><span>Daily plan</span><b>${fmtPlan(p.perDay)}</b><em>for ${p.totalDays} day${p.totalDays === 1 ? '' : 's'}</em></div>
+    <div class="plan-t"><span>Daily plan</span><b>${p.reached ? 'Done' : p.passed ? '–' : fmtPlan(p.perDay)}</b>
+      <em>${p.reached ? 'target reached' : p.passed ? 'deadline passed' : `for ${p.daysLeft} day${plural(p.daysLeft)}`}</em></div>
     ${todayTile}
-    <div class="plan-t"><span>Needed now</span><b>${p.reached ? 'Done' : p.passed ? '–' : fmtPlan(p.needed)}</b>
-      <em>${p.reached ? 'target reached' : p.passed ? 'deadline passed' : 'a day to finish'}</em></div></div>`;
+    <div class="plan-t"><span>Hours left</span><b>${p.reached ? '0h' : fmtBig(p.left)}</b><em>of ${g.targetHours}h</em></div></div>
+    ${!p.reached && !p.passed ? `<p class="hint" style="margin-top:10px">Daily plan = hours left ÷ days left. It updates every day as you log time.</p>` : ''}`;
 }
 
 /* ---------------- UI state (not saved) ---------------- */
@@ -767,7 +780,7 @@ function viewSettings() {
 function goalSheet(id) {
   const g = id ? goal(id) : null, today = dayKey(Date.now());
   const start = g?.startDate || today, hours = g?.targetHours || 100, deadline = g?.deadline || '';
-  const pv = planPreview(hours, start, deadline);
+  const pv = planPreview(hours, start, deadline, goalDoneBeforeToday(id));
   openSheet(`<form data-form="goal" data-id="${id || ''}" autocomplete="off" novalidate><h3 class="sheet-t">${g ? 'Edit goal' : 'New goal'}</h3>
     <label class="field"><span>Goal</span><input name="name" maxlength="60" value="${esc(g?.name || '')}" placeholder="e.g. Become a web developer"></label>
     <div class="grid2"><label class="field"><span>Start date</span><input name="start" type="date" ${start >= today ? `min="${today}"` : ''} value="${start}"></label>
@@ -963,7 +976,7 @@ const FORM = {
     // Deadline: today or later, and not before the start.
     if (deadline && deadline < today) return toast('Pick today or a future date for the deadline');
     if (deadline && deadline < start) return toast('The deadline must be on or after the start date');
-    if (deadline && planPreview(hours, start, deadline).warn) return toast('That needs more than 24 hours a day. Pick a later deadline or fewer hours.');
+    if (deadline && planPreview(hours, start, deadline, goalDoneBeforeToday(id)).warn) return toast('That needs more than 24 hours a day. Pick a later deadline or fewer hours.');
     const vals = { name, targetHours: Math.round(hours), startDate: start, deadline, color: d.get('color') || COLORS[0] };
     if (old) { Object.assign(old, vals); save(); back(); render(); toast('Goal updated'); }
     else { const g = newGoal(vals.name, vals.targetHours, vals.color, vals.deadline, vals.startDate); save(); sheetInto({ type: 'goal', id: g.id }); toast('Goal created. Now add a project.'); }
