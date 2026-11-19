@@ -5,7 +5,8 @@
    Everything is saved on this phone (localStorage). No server, no login.
    ===================================================================== */
 
-const KEY = 'stride.v1';
+const KEY = 'stride.v1';            // storage name: never change it, or saved data seems to disappear
+const APP_VERSION = 'v1.5 · 19 Nov 2026'; // shown in Settings, so you can see which version the phone runs
 const DAY = 86400000;
 // Project/goal colours: the brand blues first, then a few muted accents so projects stay easy to tell apart
 const COLORS = ['#5483B3', '#052659', '#7DA0CA', '#2a8c9e', '#3f6a99', '#d38b3c', '#b8566b', '#6d6fc4'];
@@ -771,7 +772,7 @@ function viewSettings() {
       ${S.sessions.length ? '' : `<button class="row" data-action="demo"><span class="r-ic">${ICON.spark}</span><div class="row-main"><b>Load sample data</b><span>See how the charts look with 2 months of data</span></div></button>`}
       <button class="row" data-action="reset"><span class="r-ic red">${ICON.trash}</span><div class="row-main"><b class="danger-t">Erase everything</b><span>Start again from zero</span></div></button>
     </div>
-    <p class="foot">Stride v1.0<br>Everything is stored only on this phone. No account, no internet needed.<br>Back up once a week so you never lose your progress.</p>`;
+    <p class="foot">Stride ${APP_VERSION}<br>Everything is stored only on this phone. No account, no internet needed.<br>Back up once a week so you never lose your progress.</p>`;
 }
 
 /* =====================================================================
@@ -1169,6 +1170,9 @@ setInterval(tick, 1000);
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
+  // Android often resumes the app instead of reloading it, so check for a new version every time it comes back
+  if (swReg) swReg.update().catch(() => {});
+  if (updatePending && !sheetsOnTop()) { location.reload(); return; }
   if (dayKey(Date.now()) !== ui.renderDay && !sheetsOnTop()) render(); else tick();
 });
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; if (ui.tab === 'settings' && !topScreen()) render(); });
@@ -1176,7 +1180,17 @@ window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); instal
 /* ---------------- start ---------------- */
 history.replaceState({ d: 0 }, '');
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+/* Updates: when a new version has been downloaded and takes over, reload once so it shows straight away.
+   (Not on the very first install, and not while a pop-up form is open: then it waits until next time.) */
+let swReg = null, updatePending = false;
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloaded) return;
+    if (sheetsOnTop()) { updatePending = true; return; }
+    reloaded = true; location.reload();
+  });
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').then(r => { swReg = r; r.update().catch(() => {}); }).catch(() => {}));
 }
 render();
